@@ -4,7 +4,7 @@ import http from 'node:http';
 import type { Socket } from 'node:net';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { eq, inArray } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { integer, sqliteTable } from 'drizzle-orm/sqlite-core';
 import {
   applySqlitePragmas,
@@ -16,9 +16,41 @@ import { RpcRequest, RpcResponse } from '../connectors/rpc/rpc_common.ts';
 
 type WsRpcRequest = RpcRequest & { id?: number };
 type WsRpcResponse = RpcResponse & { id?: number };
+type TransferBatchItem = {
+  args: Record<string, unknown>;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+};
 
 const SQLITE_FILE = process.env.SQLITE_FILE ?? './.data/accounts.sqlite';
 const mode: SqliteMode = getSqliteMode();
+
+function envFlag(name: string, defaultValue: boolean) {
+  const value = process.env[name];
+  if (value == null) return defaultValue;
+  return value !== '0' && value.toLowerCase() !== 'false';
+}
+
+function envNumber(name: string, defaultValue: number) {
+  const value = process.env[name];
+  if (value == null) return defaultValue;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : defaultValue;
+}
+
+const TRANSFER_BATCHING_ENABLED = envFlag('SQLITE_WS_RPC_BATCHING', true);
+const TRANSFER_GROUP_COMMIT_ENABLED = envFlag(
+  'SQLITE_WS_RPC_GROUP_COMMIT',
+  true,
+);
+const TRANSFER_BATCH_TRIGGER_SIZE = Math.max(
+  0,
+  Math.floor(envNumber('SQLITE_WS_RPC_BATCH_SIZE', 64)),
+);
+const TRANSFER_BATCH_WINDOW_MS = Math.max(
+  0,
+  envNumber('SQLITE_WS_RPC_BATCH_MS', 1),
+);
 
 ensureSqliteDirExistsSync(SQLITE_FILE, mode);
 
@@ -45,7 +77,14 @@ function ensureSchema() {
 
 ensureSchema();
 
-async function rpcTransfer(args: Record<string, unknown>) {
+const selectTransferAccounts = dbFile.prepare(
+  'SELECT id, balance FROM accounts WHERE id IN (?, ?)',
+);
+const updateAccountBalance = dbFile.prepare(
+  'UPDATE accounts SET balance = ? WHERE id = ?',
+);
+
+function applyTransfer(args: Record<string, unknown>) {
   const fromId = Number(args.from_id ?? args.from);
   const toId = Number(args.to_id ?? args.to);
   const amount = Number(args.amount);
@@ -60,37 +99,149 @@ async function rpcTransfer(args: Record<string, unknown>) {
   if (fromId === toId || amount <= 0) return;
 
   const delta = BigInt(amount);
+  const rows = selectTransferAccounts.all(fromId, toId) as Array<{
+    id: number;
+    balance: number;
+  }>;
 
-  db.transaction((tx) => {
-    const rows = tx
-      .select()
-      .from(accounts)
-      .where(inArray(accounts.id, [fromId, toId]))
-      .all();
+  if (rows.length !== 2) {
+    throw new Error('account_missing');
+  }
 
-    if (rows.length !== 2) {
-      throw new Error('account_missing');
+  const [first, second] = rows;
+  const fromRow = first.id === fromId ? first : second;
+  const toRow = first.id === fromId ? second : first;
+
+  const fromBal = BigInt(fromRow.balance);
+  const toBal = BigInt(toRow.balance);
+
+  if (fromBal < delta) return;
+
+  const newFrom = fromBal - delta;
+  const newTo = toBal + delta;
+
+  updateAccountBalance.run(Number(newFrom), fromId);
+  updateAccountBalance.run(Number(newTo), toId);
+}
+
+const runTransferTxn = dbFile.transaction((args: Record<string, unknown>) => {
+  applyTransfer(args);
+});
+
+const runTransferGroupCommitTxn = dbFile.transaction(
+  (batch: TransferBatchItem[]) => {
+    const outcomes: Array<Error | null> = new Array(batch.length);
+
+    for (let i = 0; i < batch.length; i++) {
+      try {
+        applyTransfer(batch[i]!.args);
+        outcomes[i] = null;
+      } catch (err) {
+        outcomes[i] = err instanceof Error ? err : new Error(String(err));
+      }
     }
 
-    const [first, second] = rows;
-    const fromRow = first.id === fromId ? first : second;
-    const toRow = first.id === fromId ? second : first;
+    return outcomes;
+  },
+);
 
-    const fromBal = BigInt(fromRow.balance);
-    const toBal = BigInt(toRow.balance);
+let transferQueue: TransferBatchItem[] = [];
+let transferFlushPromise: Promise<void> | null = null;
+let transferFlushTimer: NodeJS.Timeout | null = null;
 
-    if (fromBal < delta) return;
+function clearTransferFlushTimer() {
+  if (!transferFlushTimer) return;
+  clearTimeout(transferFlushTimer);
+  transferFlushTimer = null;
+}
 
-    const newFrom = fromBal - delta;
-    const newTo = toBal + delta;
+function resolveTransferBatch(
+  batch: TransferBatchItem[],
+  outcomes: Array<Error | null>,
+) {
+  for (let i = 0; i < batch.length; i++) {
+    const outcome = outcomes[i];
+    if (outcome) {
+      batch[i]!.reject(outcome);
+    } else {
+      batch[i]!.resolve();
+    }
+  }
+}
 
-    tx.update(accounts)
-      .set({ balance: Number(newFrom) })
-      .where(eq(accounts.id, fromId));
+async function flushTransferQueue(): Promise<void> {
+  if (transferFlushPromise) {
+    await transferFlushPromise;
+    if (transferQueue.length === 0) {
+      return;
+    }
+  }
 
-    tx.update(accounts)
-      .set({ balance: Number(newTo) })
-      .where(eq(accounts.id, toId));
+  if (transferQueue.length === 0) {
+    return;
+  }
+
+  clearTransferFlushTimer();
+  const batch = transferQueue;
+  transferQueue = [];
+
+  transferFlushPromise = Promise.resolve().then(() => {
+    if (TRANSFER_GROUP_COMMIT_ENABLED) {
+      const outcomes = runTransferGroupCommitTxn(batch);
+      resolveTransferBatch(batch, outcomes);
+      return;
+    }
+
+    for (const item of batch) {
+      try {
+        runTransferTxn(item.args);
+        item.resolve();
+      } catch (err) {
+        item.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  });
+
+  try {
+    await transferFlushPromise;
+  } finally {
+    transferFlushPromise = null;
+    if (transferQueue.length > 0) {
+      await flushTransferQueue();
+    }
+  }
+}
+
+function scheduleTransferFlush() {
+  if (transferFlushPromise || transferQueue.length === 0) {
+    return;
+  }
+
+  const sizeTriggered =
+    TRANSFER_BATCH_TRIGGER_SIZE > 0 &&
+    transferQueue.length >= TRANSFER_BATCH_TRIGGER_SIZE;
+  if (sizeTriggered || TRANSFER_BATCH_WINDOW_MS === 0) {
+    void flushTransferQueue();
+    return;
+  }
+
+  if (TRANSFER_BATCH_WINDOW_MS > 0 && !transferFlushTimer) {
+    transferFlushTimer = setTimeout(() => {
+      transferFlushTimer = null;
+      void flushTransferQueue();
+    }, TRANSFER_BATCH_WINDOW_MS);
+  }
+}
+
+async function rpcTransfer(args: Record<string, unknown>) {
+  if (!TRANSFER_BATCHING_ENABLED) {
+    runTransferTxn(args);
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    transferQueue.push({ args, resolve, reject });
+    scheduleTransferFlush();
   });
 }
 
@@ -217,6 +368,10 @@ async function handleRpc(body: RpcRequest): Promise<RpcResponse> {
   if (!name) return { ok: false, error: 'missing name' };
 
   try {
+    if (name !== 'transfer' && transferQueue.length > 0) {
+      await flushTransferQueue();
+    }
+
     switch (name) {
       case 'health':
         return { ok: true, result: { status: 'ok' } };
@@ -456,5 +611,8 @@ server.on('upgrade', (req, socket) => {
 server.listen(port, () => {
   console.log(
     `sqlite drizzle ws rpc server listening on ws://localhost:${port}`,
+  );
+  console.log(
+    `[sqlite-ws-rpc] batching=${TRANSFER_BATCHING_ENABLED ? 'on' : 'off'} group_commit=${TRANSFER_GROUP_COMMIT_ENABLED ? 'on' : 'off'} batch_size=${TRANSFER_BATCH_TRIGGER_SIZE} batch_ms=${TRANSFER_BATCH_WINDOW_MS}`,
   );
 });
